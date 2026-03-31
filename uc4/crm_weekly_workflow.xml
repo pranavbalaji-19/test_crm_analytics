@@ -1,0 +1,237 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    Automic (UC4) Workflow Export
+    Workflow  : CRM_WEEKLY_WORKFLOW
+    System    : CRM Analytics ETL
+    Schedule  : Every Sunday at 04:00 (weekly batch) + Daily for segment refresh
+    Owner     : CRM_ANALYTICS_TEAM
+    Version   : 2.5
+
+    Cross-repo dependencies (predecessors from other repos):
+      - FINANCE_DAILY_WORKFLOW / FINANCE_DAILY_GL_CLOSE
+        (event: FINANCE_GL_CLOSE_COMPLETE) — finance_etl_legacy
+      - RETAIL_DAILY_WORKFLOW / RETAIL_COMPLETION_NOTIFY
+        (event: RETAIL_DAILY_COMPLETE) — retail_dw_legacy
+
+    This workflow consumes shared tables:
+      - DW_OWNER.STG_CUSTOMER_SALES   (retail_dw_legacy)
+      - DW_OWNER.FACT_REGIONAL_SUMMARY (retail_dw_legacy)
+      - FINANCE_SCHEMA.FACT_PERIOD_RECONCILIATION (finance_etl_legacy)
+-->
+<UC4_WORKFLOW name="CRM_WEEKLY_WORKFLOW" type="JOBP" client="100" version="2.5">
+
+    <HEADER>
+        <DESCRIPTION>CRM weekly customer segment processing: scoring, campaign performance, segment summaries</DESCRIPTION>
+        <CATEGORY>CRM_ANALYTICS</CATEGORY>
+        <PRIORITY>40</PRIORITY>
+        <MAX_PARALLEL_TASKS>4</MAX_PARALLEL_TASKS>
+        <CALENDAR>WEEKLY_SUNDAY</CALENDAR>
+        <SCHEDULE_TIME>04:00</SCHEDULE_TIME>
+        <TIMEZONE>Europe/London</TIMEZONE>
+        <SLA_MINUTES>300</SLA_MINUTES>
+    </HEADER>
+
+    <VARIABLES>
+        <VAR name="RUN_DATE"         type="DATE"   format="YYYY-MM-DD" value="&amp;$TODAY"/>
+        <VAR name="RUN_DATE_FMT"     type="STRING" value="&amp;$TODAY_YYYYMMDD"/>
+        <VAR name="BATCH_SIZE"       type="NUMBER" value="5000"/>
+        <VAR name="NOTIFY_EMAIL"     type="STRING" value="crm-analytics@company.com"/>
+        <VAR name="MODEL_VERSION"    type="STRING" value="v2.1"/>
+        <VAR name="RETRY_MAX"        type="NUMBER" value="3"/>
+        <VAR name="ALLOW_EMPTY"      type="STRING" value="N"/>
+    </VARIABLES>
+
+    <!-- ============================================================
+         JOB 1: Wait for cross-repo Finance event
+         Must wait for FINANCE_DAILY_GL_CLOSE from finance_etl_legacy
+    ============================================================ -->
+    <JOB name="CRM_WAIT_FINANCE_EVENT" type="JOBW" task_id="1">
+        <DESCRIPTION>Wait for FINANCE_GL_CLOSE_COMPLETE event from finance_etl_legacy</DESCRIPTION>
+        <AGENT>ETL_AGENT_CRM_01</AGENT>
+        <WAIT_FOR_EVENT name="FINANCE_GL_CLOSE_COMPLETE" value="&amp;RUN_DATE"/>
+        <TIMEOUT_MINUTES>120</TIMEOUT_MINUTES>
+        <PREDECESSORS/>
+        <ON_SUCCESS next_task="CRM_WAIT_RETAIL_EVENT"/>
+        <ON_TIMEOUT action="NOTIFY_AND_ABORT" notify="&NOTIFY_EMAIL"/>
+        <!-- Source: finance_etl_legacy/uc4/finance_daily.json -->
+    </JOB>
+
+    <!-- ============================================================
+         JOB 2: Wait for cross-repo Retail event
+         Must wait for RETAIL_DAILY_COMPLETE from retail_dw_legacy
+    ============================================================ -->
+    <JOB name="CRM_WAIT_RETAIL_EVENT" type="JOBW" task_id="2">
+        <DESCRIPTION>Wait for RETAIL_DAILY_COMPLETE event from retail_dw_legacy</DESCRIPTION>
+        <AGENT>ETL_AGENT_CRM_01</AGENT>
+        <WAIT_FOR_EVENT name="RETAIL_DAILY_COMPLETE" value="&amp;RUN_DATE"/>
+        <TIMEOUT_MINUTES>60</TIMEOUT_MINUTES>
+        <PREDECESSORS>
+            <PREDECESSOR job="CRM_WAIT_FINANCE_EVENT" condition="SUCCESS"/>
+        </PREDECESSORS>
+        <ON_SUCCESS next_task="CRM_CUSTOMER_EXTRACT_VIP,CRM_CUSTOMER_EXTRACT_RETAIL,CRM_CUSTOMER_EXTRACT_WHOLESALE"/>
+        <ON_TIMEOUT action="NOTIFY" notify="&NOTIFY_EMAIL" then="CONTINUE"/>
+        <!-- Source: retail_dw_legacy/uc4/retail_daily_workflow.xml -->
+    </JOB>
+
+    <!-- ============================================================
+         JOB 3a: Extract VIP segment (parallel)
+    ============================================================ -->
+    <JOB name="CRM_CUSTOMER_EXTRACT_VIP" type="JOBS" task_id="3">
+        <DESCRIPTION>Extract and load VIP customer segment</DESCRIPTION>
+        <AGENT>ETL_AGENT_CRM_01</AGENT>
+        <SCRIPT_NAME>process_customer_data.ksh</SCRIPT_NAME>
+        <SCRIPT_ARGS>&amp;RUN_DATE VIP &amp;BATCH_SIZE</SCRIPT_ARGS>
+        <WORKING_DIR>/opt/etl/scripts</WORKING_DIR>
+        <PREDECESSORS>
+            <PREDECESSOR job="CRM_WAIT_RETAIL_EVENT" condition="SUCCESS_OR_WARNING"/>
+        </PREDECESSORS>
+        <ON_SUCCESS next_task="CRM_ABINITIO_TRANSFORM"/>
+        <ON_FAILURE action="NOTIFY_AND_ABORT" notify="&NOTIFY_EMAIL"/>
+        <RETRY max_retries="&RETRY_MAX" wait_seconds="60"/>
+        <TIMEOUT_MINUTES>120</TIMEOUT_MINUTES>
+    </JOB>
+
+    <!-- ============================================================
+         JOB 3b: Extract RETAIL segment (parallel)
+    ============================================================ -->
+    <JOB name="CRM_CUSTOMER_EXTRACT_RETAIL" type="JOBS" task_id="4">
+        <DESCRIPTION>Extract and load RETAIL customer segment</DESCRIPTION>
+        <AGENT>ETL_AGENT_CRM_02</AGENT>
+        <SCRIPT_NAME>process_customer_data.ksh</SCRIPT_NAME>
+        <SCRIPT_ARGS>&amp;RUN_DATE RETAIL &amp;BATCH_SIZE</SCRIPT_ARGS>
+        <PREDECESSORS>
+            <PREDECESSOR job="CRM_WAIT_RETAIL_EVENT" condition="SUCCESS_OR_WARNING"/>
+        </PREDECESSORS>
+        <ON_SUCCESS next_task="CRM_ABINITIO_TRANSFORM"/>
+        <ON_FAILURE action="NOTIFY_AND_ABORT" notify="&NOTIFY_EMAIL"/>
+        <RETRY max_retries="&RETRY_MAX" wait_seconds="60"/>
+        <TIMEOUT_MINUTES>180</TIMEOUT_MINUTES>
+    </JOB>
+
+    <!-- ============================================================
+         JOB 3c: Extract WHOLESALE segment (parallel)
+    ============================================================ -->
+    <JOB name="CRM_CUSTOMER_EXTRACT_WHOLESALE" type="JOBS" task_id="5">
+        <DESCRIPTION>Extract and load WHOLESALE customer segment</DESCRIPTION>
+        <AGENT>ETL_AGENT_CRM_03</AGENT>
+        <SCRIPT_NAME>process_customer_data.ksh</SCRIPT_NAME>
+        <SCRIPT_ARGS>&amp;RUN_DATE WHOLESALE &amp;BATCH_SIZE</SCRIPT_ARGS>
+        <PREDECESSORS>
+            <PREDECESSOR job="CRM_WAIT_RETAIL_EVENT" condition="SUCCESS_OR_WARNING"/>
+        </PREDECESSORS>
+        <ON_SUCCESS next_task="CRM_ABINITIO_TRANSFORM"/>
+        <ON_FAILURE action="NOTIFY_AND_ABORT" notify="&NOTIFY_EMAIL"/>
+        <RETRY max_retries="&RETRY_MAX" wait_seconds="60"/>
+        <TIMEOUT_MINUTES>120</TIMEOUT_MINUTES>
+    </JOB>
+
+    <!-- ============================================================
+         JOB 4: Ab Initio customer_transform.xfr (all segments complete)
+    ============================================================ -->
+    <JOB name="CRM_ABINITIO_TRANSFORM" type="JOBS" task_id="6">
+        <DESCRIPTION>Run customer_transform.xfr Ab Initio graph for full segment enrichment</DESCRIPTION>
+        <AGENT>ABINITIO_AGENT_CRM</AGENT>
+        <COMMAND type="AIR_COMMAND">
+            <![CDATA[
+            air sandbox run crm_customer_transform/customer_transform.xfr \
+                -param RUN_DATE=&RUN_DATE \
+                -param CUSTOMER_SEGMENT=ALL \
+                -param CRM_ORA_CONNECT=${CRM_ORA_CONNECT} \
+                -param AB_PARALLELISM=4
+            ]]>
+        </COMMAND>
+        <PREDECESSORS>
+            <PREDECESSOR job="CRM_CUSTOMER_EXTRACT_VIP"       condition="SUCCESS"/>
+            <PREDECESSOR job="CRM_CUSTOMER_EXTRACT_RETAIL"    condition="SUCCESS"/>
+            <PREDECESSOR job="CRM_CUSTOMER_EXTRACT_WHOLESALE" condition="SUCCESS"/>
+        </PREDECESSORS>
+        <ON_SUCCESS next_task="CRM_SPARK_SEGMENTATION,CRM_PYTHON_LINEAGE"/>
+        <ON_FAILURE action="NOTIFY_AND_ABORT" notify="&NOTIFY_EMAIL"/>
+        <TIMEOUT_MINUTES>150</TIMEOUT_MINUTES>
+    </JOB>
+
+    <!-- ============================================================
+         JOB 5a: Spark customer segmentation (reads from Retail + CRM)
+    ============================================================ -->
+    <JOB name="CRM_SPARK_SEGMENTATION" type="JOBS" task_id="7">
+        <DESCRIPTION>Run Scala Spark customer_segmentation.scala - reads retail and CRM staging</DESCRIPTION>
+        <AGENT>SPARK_AGENT_CRM</AGENT>
+        <COMMAND type="SPARK_SUBMIT">
+            <![CDATA[
+            spark-submit \
+              --class com.company.crm.CustomerSegmentation \
+              --master yarn --deploy-mode cluster \
+              --num-executors 6 --executor-memory 4g \
+              /opt/spark/jobs/crm-analytics-assembly.jar \
+              --run-date &RUN_DATE \
+              --model-version &MODEL_VERSION
+            ]]>
+        </COMMAND>
+        <PREDECESSORS>
+            <PREDECESSOR job="CRM_ABINITIO_TRANSFORM" condition="SUCCESS"/>
+        </PREDECESSORS>
+        <ON_SUCCESS next_task="CRM_COMPLETION_NOTIFY"/>
+        <ON_FAILURE action="NOTIFY_AND_ABORT" notify="&NOTIFY_EMAIL"/>
+        <TIMEOUT_MINUTES>90</TIMEOUT_MINUTES>
+    </JOB>
+
+    <!-- ============================================================
+         JOB 5b: Python lineage tracker (parallel with Spark)
+    ============================================================ -->
+    <JOB name="CRM_PYTHON_LINEAGE" type="JOBS" task_id="8">
+        <DESCRIPTION>Run crm_lineage_tracker.py to document source-to-target lineage</DESCRIPTION>
+        <AGENT>ETL_AGENT_CRM_01</AGENT>
+        <COMMAND type="PYTHON_SCRIPT">
+            <![CDATA[
+            python3 /opt/etl/python/crm_lineage_tracker.py \
+                --run-date &RUN_DATE \
+                --workflow CRM_WEEKLY_WORKFLOW \
+                --output-dir /opt/etl/lineage/crm
+            ]]>
+        </COMMAND>
+        <PREDECESSORS>
+            <PREDECESSOR job="CRM_ABINITIO_TRANSFORM" condition="SUCCESS"/>
+        </PREDECESSORS>
+        <ON_SUCCESS next_task="CRM_COMPLETION_NOTIFY"/>
+        <ON_FAILURE action="NOTIFY" notify="&NOTIFY_EMAIL" then="CONTINUE"/>
+        <!-- Lineage tracking failure is non-fatal -->
+        <TIMEOUT_MINUTES>30</TIMEOUT_MINUTES>
+    </JOB>
+
+    <!-- ============================================================
+         JOB 6: Completion
+    ============================================================ -->
+    <JOB name="CRM_COMPLETION_NOTIFY" type="JOBS" task_id="9">
+        <DESCRIPTION>Send completion notification</DESCRIPTION>
+        <AGENT>ETL_AGENT_CRM_01</AGENT>
+        <COMMAND type="INLINE_SCRIPT">
+            <![CDATA[
+            echo "CRM_WEEKLY_WORKFLOW completed for RUN_DATE=&RUN_DATE" | \
+                mailx -s "[CRM-OK] Weekly CRM Load &RUN_DATE" &NOTIFY_EMAIL
+            ]]>
+        </COMMAND>
+        <PREDECESSORS>
+            <PREDECESSOR job="CRM_SPARK_SEGMENTATION" condition="SUCCESS"/>
+            <PREDECESSOR job="CRM_PYTHON_LINEAGE"     condition="SUCCESS_OR_WARNING"/>
+        </PREDECESSORS>
+    </JOB>
+
+    <SCHEDULE>
+        <TRIGGER type="TIME" time="04:00" days="SUN" timezone="Europe/London"/>
+        <TRIGGER type="EVENT" event="RETAIL_DAILY_COMPLETE"/>
+        <TRIGGER type="MANUAL"/>
+    </SCHEDULE>
+
+    <EXTERNAL_PREDECESSORS>
+        <!-- Consumes events published by finance_etl_legacy and retail_dw_legacy -->
+        <EVENT name="FINANCE_GL_CLOSE_COMPLETE" source_workflow="FINANCE_DAILY_WORKFLOW"  source_repo="finance_etl_legacy"/>
+        <EVENT name="RETAIL_DAILY_COMPLETE"     source_workflow="RETAIL_DAILY_WORKFLOW"   source_repo="retail_dw_legacy"/>
+    </EXTERNAL_PREDECESSORS>
+
+    <NOTIFICATIONS>
+        <ON_WORKFLOW_FAILURE recipients="crm-analytics@company.com,dw-alerts@company.com" subject="[CRITICAL] CRM_WEEKLY_WORKFLOW FAILED for &RUN_DATE"/>
+        <ON_WORKFLOW_SUCCESS  recipients="crm-analytics@company.com"                      subject="[OK] CRM_WEEKLY_WORKFLOW complete for &RUN_DATE"/>
+        <ON_SLA_BREACH        recipients="dw-alerts@company.com"                          subject="[SLA] CRM_WEEKLY_WORKFLOW exceeded 5h window"/>
+    </NOTIFICATIONS>
+
+</UC4_WORKFLOW>

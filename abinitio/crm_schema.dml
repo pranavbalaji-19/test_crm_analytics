@@ -1,0 +1,83 @@
+-- =============================================================================
+-- Ab Initio DML Schema File
+-- Project  : crm_customer_transform
+-- File     : crm_schema.dml
+-- Purpose  : Field definitions for CRM customer transformation graph
+--            (customer_transform.xfr).
+-- =============================================================================
+
+-- Raw customer profile from staging
+define record stg_customer_profile(
+    customer_id         decimal(10,0),
+    customer_code       string(20),
+    first_name          string(100),
+    last_name           string(100),
+    date_of_birth       date("YYYY-MM-DD"),
+    email               string(200),
+    phone               string(30),
+    postcode            string(10),
+    region_code         string(10),
+    customer_segment    string(30),
+    acquisition_channel string(30),
+    is_opted_in_email   string(1),
+    load_date           date("YYYY-MM-DD")
+);
+
+-- Campaign event record
+define record campaign_event_record(
+    event_id            decimal(15,0),
+    customer_id         decimal(10,0),
+    campaign_id         string(20),
+    campaign_name       string(200),
+    event_type          string(30),
+    event_date          date("YYYY-MM-DD"),
+    channel             string(20),
+    revenue_attributed  decimal(14,4)
+);
+
+-- Enriched customer record (post-join with retail spend data)
+define record enriched_customer_record(
+    customer_id             decimal(10,0),
+    customer_code           string(20),
+    full_name               string(200),
+    email                   string(200),
+    region_code             string(10),
+    customer_segment        string(30),
+    acquisition_channel     string(30),
+    is_opted_in_email       string(1),
+    lifetime_value          decimal(14,2),
+    loyalty_tier            string(20),
+    last_purchase_date      date("YYYY-MM-DD"),
+    days_since_purchase     decimal(6,0),
+    campaign_conversions    decimal(6,0),
+    total_campaign_revenue  decimal(14,4),
+    interaction_count_30d   decimal(6,0),
+    avg_satisfaction_score  decimal(4,2),
+    clv_score               decimal(12,4),
+    churn_risk_score        decimal(5,4),
+    engagement_score        decimal(5,4),
+    segment_label           string(100)
+);
+
+-- Segment aggregate output
+define record segment_aggregate_record(
+    segment_code            string(30),
+    region_code             string(10),
+    summary_date            date("YYYY-MM-DD"),
+    customer_count          decimal(10,0),
+    avg_clv_score           decimal(12,4),
+    avg_churn_risk          decimal(8,6),
+    high_value_count        decimal(10,0),
+    at_risk_count           decimal(10,0),
+    opted_in_email_count    decimal(10,0),
+    total_retail_spend      decimal(18,4)
+);
+
+-- Retail spend lookup record (from DW_OWNER.STG_CUSTOMER_SALES)
+define record retail_spend_record(
+    customer_id         decimal(10,0),
+    lifetime_value      decimal(14,2),
+    loyalty_tier        string(20),
+    last_purchase_date  date("YYYY-MM-DD"),
+    region_code         string(10)
+);

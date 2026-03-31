@@ -1,0 +1,189 @@
+-- =============================================================================
+-- CRM ANALYTICS LEGACY - Oracle 19c DDL
+-- System: Customer Relationship Management Analytics
+-- Owner: CRM_SCHEMA
+-- Cross-repo: Reads from DW_OWNER.STG_CUSTOMER_SALES
+--             Reads from DW_OWNER.FACT_REGIONAL_SUMMARY
+--             Reads from FINANCE_SCHEMA.FACT_PERIOD_RECONCILIATION
+-- Last Modified: 2024-01-22
+-- =============================================================================
+
+-- ---------------------------------------------------------------------------
+-- STAGING TABLES
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE STG_CUSTOMER_PROFILE (
+    CUSTOMER_ID         NUMBER(10)     NOT NULL,
+    CUSTOMER_CODE       VARCHAR2(20)   NOT NULL,
+    FIRST_NAME          VARCHAR2(100),
+    LAST_NAME           VARCHAR2(100),
+    DATE_OF_BIRTH       DATE,
+    EMAIL               VARCHAR2(200),
+    PHONE               VARCHAR2(30),
+    MOBILE              VARCHAR2(30),
+    ADDRESS_LINE1       VARCHAR2(200),
+    ADDRESS_LINE2       VARCHAR2(200),
+    CITY                VARCHAR2(100),
+    POSTCODE            VARCHAR2(10),
+    COUNTRY_CODE        VARCHAR2(3)    DEFAULT 'GB',
+    REGION_CODE         VARCHAR2(10),
+    CUSTOMER_SEGMENT    VARCHAR2(30),  -- e.g. RETAIL, WHOLESALE, VIP
+    ACQUISITION_CHANNEL VARCHAR2(30),
+    REGISTRATION_DATE   DATE,
+    IS_OPTED_IN_EMAIL   CHAR(1)        DEFAULT 'N',
+    IS_OPTED_IN_SMS     CHAR(1)        DEFAULT 'N',
+    LOAD_DATE           DATE           DEFAULT SYSDATE,
+    ETL_STATUS          VARCHAR2(20)   DEFAULT 'PENDING',
+    CONSTRAINT PK_STG_CUSTOMER_PROFILE PRIMARY KEY (CUSTOMER_ID)
+);
+
+CREATE TABLE STG_CAMPAIGN_EVENTS (
+    EVENT_ID            NUMBER(15)     NOT NULL,
+    CUSTOMER_ID         NUMBER(10)     NOT NULL,
+    CAMPAIGN_ID         VARCHAR2(20)   NOT NULL,
+    CAMPAIGN_NAME       VARCHAR2(200),
+    EVENT_TYPE          VARCHAR2(30),  -- SENT, OPENED, CLICKED, CONVERTED, UNSUBSCRIBED
+    EVENT_DATE          DATE           NOT NULL,
+    CHANNEL             VARCHAR2(20),  -- EMAIL, SMS, PUSH, DIRECT_MAIL
+    OFFER_CODE          VARCHAR2(20),
+    REVENUE_ATTRIBUTED  NUMBER(14,4)   DEFAULT 0,
+    LOAD_DATE           DATE           DEFAULT SYSDATE,
+    CONSTRAINT PK_STG_CAMPAIGN PRIMARY KEY (EVENT_ID)
+);
+
+CREATE TABLE STG_CUSTOMER_INTERACTIONS (
+    INTERACTION_ID      NUMBER(15)     NOT NULL,
+    CUSTOMER_ID         NUMBER(10)     NOT NULL,
+    INTERACTION_TYPE    VARCHAR2(30),  -- CALL, CHAT, EMAIL, IN_STORE, COMPLAINT
+    INTERACTION_DATE    DATE,
+    CHANNEL             VARCHAR2(20),
+    AGENT_ID            NUMBER(8),
+    RESOLUTION_CODE     VARCHAR2(20),
+    SATISFACTION_SCORE  NUMBER(3,1),   -- 1.0 - 10.0
+    DURATION_MINUTES    NUMBER(6),
+    NOTES               VARCHAR2(500),
+    LOAD_DATE           DATE           DEFAULT SYSDATE,
+    CONSTRAINT PK_STG_INTERACTION PRIMARY KEY (INTERACTION_ID)
+);
+
+-- ---------------------------------------------------------------------------
+-- DIMENSION TABLES (SCD Type 2)
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE DIM_CUSTOMER_CRM (
+    DIM_CRM_CUSTOMER_KEY  NUMBER(12)   NOT NULL,
+    CUSTOMER_ID           NUMBER(10)   NOT NULL,  -- natural key
+    CUSTOMER_CODE         VARCHAR2(20),
+    FULL_NAME             VARCHAR2(200),
+    EMAIL                 VARCHAR2(200),
+    PHONE                 VARCHAR2(30),
+    DATE_OF_BIRTH         DATE,
+    POSTCODE              VARCHAR2(10),
+    REGION_CODE           VARCHAR2(10),
+    CUSTOMER_SEGMENT      VARCHAR2(30),
+    ACQUISITION_CHANNEL   VARCHAR2(30),
+    IS_OPTED_IN_EMAIL     CHAR(1),
+    -- SCD Type 2 historization
+    VALID_FROM            DATE          NOT NULL,
+    VALID_TO              DATE          DEFAULT TO_DATE('9999-12-31','YYYY-MM-DD'),
+    IS_CURRENT            CHAR(1)       DEFAULT 'Y',
+    VERSION_NUM           NUMBER(4)     DEFAULT 1,
+    CREATED_DATE          DATE          DEFAULT SYSDATE,
+    UPDATED_DATE          DATE,
+    CONSTRAINT PK_DIM_CRM_CUSTOMER PRIMARY KEY (DIM_CRM_CUSTOMER_KEY)
+);
+
+CREATE TABLE DIM_CAMPAIGN (
+    DIM_CAMPAIGN_KEY    NUMBER(10)     NOT NULL,
+    CAMPAIGN_ID         VARCHAR2(20)   NOT NULL,
+    CAMPAIGN_NAME       VARCHAR2(200),
+    CAMPAIGN_TYPE       VARCHAR2(30),
+    START_DATE          DATE,
+    END_DATE            DATE,
+    TARGET_SEGMENT      VARCHAR2(30),
+    BUDGET_GBP          NUMBER(14,2),
+    CHANNEL             VARCHAR2(20),
+    IS_ACTIVE           CHAR(1)        DEFAULT 'Y',
+    CONSTRAINT PK_DIM_CAMPAIGN PRIMARY KEY (DIM_CAMPAIGN_KEY)
+);
+
+-- ---------------------------------------------------------------------------
+-- FACT TABLES
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE FACT_CUSTOMER_SCORES (
+    SCORE_KEY           NUMBER(15)     NOT NULL,
+    CUSTOMER_ID         NUMBER(10)     NOT NULL,
+    DIM_CRM_CUSTOMER_KEY NUMBER(12),
+    SCORE_DATE          DATE           NOT NULL,
+    CLV_SCORE           NUMBER(12,4),   -- Customer Lifetime Value
+    CHURN_RISK_SCORE    NUMBER(5,4),    -- 0.0 - 1.0 probability
+    PROPENSITY_BUY_SCORE NUMBER(5,4),
+    ENGAGEMENT_SCORE    NUMBER(5,4),
+    SEGMENT_CODE        VARCHAR2(30),
+    SEGMENT_LABEL       VARCHAR2(100),
+    BATCH_RUN_DATE      DATE           DEFAULT SYSDATE,
+    MODEL_VERSION       VARCHAR2(20),
+    LOAD_BATCH_ID       NUMBER(10),
+    CONSTRAINT PK_FACT_SCORES PRIMARY KEY (SCORE_KEY)
+);
+
+CREATE TABLE FACT_CAMPAIGN_PERFORMANCE (
+    PERF_KEY            NUMBER(15)     NOT NULL,
+    DIM_CAMPAIGN_KEY    NUMBER(10),
+    CAMPAIGN_ID         VARCHAR2(20),
+    PERFORMANCE_DATE    DATE,
+    TOTAL_SENT          NUMBER(10),
+    TOTAL_OPENED        NUMBER(10),
+    TOTAL_CLICKED       NUMBER(10),
+    TOTAL_CONVERTED     NUMBER(10),
+    TOTAL_UNSUBSCRIBED  NUMBER(10),
+    REVENUE_ATTRIBUTED  NUMBER(18,4),
+    OPEN_RATE           NUMBER(8,6),
+    CLICK_RATE          NUMBER(8,6),
+    CONVERSION_RATE     NUMBER(8,6),
+    LOAD_DATE           DATE           DEFAULT SYSDATE,
+    CONSTRAINT PK_FACT_CAMPAIGN_PERF PRIMARY KEY (PERF_KEY)
+);
+
+-- Analytical output - also written to by Spark, read by reporting layer
+CREATE TABLE FACT_CUSTOMER_SEGMENT_SUMMARY (
+    SEGMENT_SUMMARY_KEY   NUMBER(15)   NOT NULL,
+    SEGMENT_CODE          VARCHAR2(30) NOT NULL,
+    REGION_CODE           VARCHAR2(10),
+    SUMMARY_DATE          DATE         NOT NULL,
+    CUSTOMER_COUNT        NUMBER(10),
+    AVG_CLV_SCORE         NUMBER(12,4),
+    AVG_CHURN_RISK        NUMBER(8,6),
+    HIGH_VALUE_COUNT      NUMBER(10),
+    AT_RISK_COUNT         NUMBER(10),
+    TOTAL_RETAIL_SPEND    NUMBER(18,4),  -- from DW_OWNER.FACT_REGIONAL_SUMMARY
+    TOTAL_CAMPAIGN_SPEND  NUMBER(14,4),
+    LOAD_DATE             DATE         DEFAULT SYSDATE,
+    CONSTRAINT PK_SEGMENT_SUMMARY PRIMARY KEY (SEGMENT_SUMMARY_KEY)
+);
+
+-- ---------------------------------------------------------------------------
+-- SEQUENCES
+-- ---------------------------------------------------------------------------
+CREATE SEQUENCE SEQ_DIM_CRM_CUST_KEY  START WITH 1000 INCREMENT BY 1 NOCACHE;
+CREATE SEQUENCE SEQ_DIM_CAMPAIGN_KEY  START WITH 1000 INCREMENT BY 1 NOCACHE;
+CREATE SEQUENCE SEQ_FACT_SCORE_KEY    START WITH 1000 INCREMENT BY 1 NOCACHE;
+CREATE SEQUENCE SEQ_FACT_CAMP_PERF    START WITH 1000 INCREMENT BY 1 NOCACHE;
+CREATE SEQUENCE SEQ_SEGMENT_SUMMARY   START WITH 1000 INCREMENT BY 1 NOCACHE;
+CREATE SEQUENCE SEQ_CRM_BATCH_ID      START WITH 1    INCREMENT BY 1 NOCACHE;
+
+-- ---------------------------------------------------------------------------
+-- INDEXES
+-- ---------------------------------------------------------------------------
+CREATE INDEX IDX_STG_CUST_SEGMENT   ON STG_CUSTOMER_PROFILE(CUSTOMER_SEGMENT, LOAD_DATE);
+CREATE INDEX IDX_DIM_CRM_CURR       ON DIM_CUSTOMER_CRM(CUSTOMER_ID, IS_CURRENT, VALID_TO);
+CREATE INDEX IDX_FACT_SCORE_DATE    ON FACT_CUSTOMER_SCORES(SCORE_DATE, SEGMENT_CODE);
+CREATE INDEX IDX_FACT_CAMP_DATE     ON FACT_CAMPAIGN_PERFORMANCE(PERFORMANCE_DATE, CAMPAIGN_ID);
+CREATE INDEX IDX_SEGMENT_DATE       ON FACT_CUSTOMER_SEGMENT_SUMMARY(SUMMARY_DATE, SEGMENT_CODE);
+
+-- Cross-repo: read from Retail DW shared tables
+-- STG_CUSTOMER_SALES (DW_OWNER) - grants set in RETAIL_DDL.sql
+-- FACT_REGIONAL_SUMMARY (DW_OWNER) - grants set in RETAIL_DDL.sql
+-- FACT_PERIOD_RECONCILIATION (FINANCE_SCHEMA) - grants set in FINANCE_DDL.sql
+-- DIM_ACCOUNT (FINANCE_SCHEMA) - grants set in FINANCE_DDL.sql

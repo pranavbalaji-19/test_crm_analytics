@@ -1,0 +1,297 @@
+-- =============================================================================
+-- Ab Initio Graph Definition (XFR)
+-- Project   : crm_customer_transform
+-- Graph     : customer_transform.xfr
+-- Purpose   : Transforms CRM customer profiles: joins with retail spend data
+--             from shared staging (DW_OWNER.STG_CUSTOMER_SALES), computes
+--             engagement and churn metrics, aggregates to segment level.
+--             Components: Reformat=SELECT/CASE, Filter=WHERE, Rollup=GROUP BY,
+--             Join=LEFT OUTER JOIN
+-- =============================================================================
+
+[graph]
+name = "customer_transform"
+description = "CRM customer enrichment, scoring, and segment aggregation"
+dml_file = "crm_schema.dml"
+parallelism = ${AB_PARALLELISM:-4}
+
+-- ============================================================
+-- COMPONENT 1: Read CRM customer profiles from staging
+-- ============================================================
+[component "read_stg_customers"]
+type = "read_oracle"
+table = "STG_CUSTOMER_PROFILE"
+where_clause = "LOAD_DATE = TO_DATE('${RUN_DATE}','YYYY-MM-DD') AND CUSTOMER_SEGMENT = '${CUSTOMER_SEGMENT}' AND ETL_STATUS = 'PENDING'"
+output_schema = "stg_customer_profile"
+fetch_size = 5000
+connection = "${CRM_ORA_CONNECT}"
+
+-- ============================================================
+-- COMPONENT 2: Read retail spend from shared DW_OWNER staging table
+-- Cross-repo read: DW_OWNER.STG_CUSTOMER_SALES
+-- Equivalent SQL: SELECT * FROM DW_OWNER.STG_CUSTOMER_SALES WHERE ...
+-- ============================================================
+[component "read_retail_spend"]
+type = "read_oracle"
+table = "DW_OWNER.STG_CUSTOMER_SALES"
+where_clause = "LOAD_DATE >= TO_DATE('${RUN_DATE}','YYYY-MM-DD') - 7"
+output_schema = "retail_spend_record"
+connection = "${CRM_ORA_CONNECT}"
+
+-- ============================================================
+-- COMPONENT 3: Read campaign events
+-- ============================================================
+[component "read_campaign_events"]
+type = "read_oracle"
+table = "STG_CAMPAIGN_EVENTS"
+where_clause = "LOAD_DATE = TO_DATE('${RUN_DATE}','YYYY-MM-DD')"
+output_schema = "campaign_event_record"
+connection = "${CRM_ORA_CONNECT}"
+
+-- ============================================================
+-- COMPONENT 4: Rollup campaign events to customer level
+-- Equivalent SQL:
+--   SELECT customer_id,
+--          SUM(CASE WHEN event_type='CONVERTED' THEN 1 ELSE 0 END) AS conversions,
+--          SUM(revenue_attributed) AS total_revenue
+--   FROM STG_CAMPAIGN_EVENTS
+--   GROUP BY customer_id
+-- ============================================================
+[component "rollup_campaign_by_customer"]
+type = "rollup"
+input  = "read_campaign_events.out"
+output = "campaign_summary_by_customer"
+input_schema  = "campaign_event_record"
+group_by      = "customer_id"
+
+aggregate = <<CAMP_ROLLUP
+    initialise:
+        out.customer_id            = in.customer_id;
+        out.campaign_conversions   = 0;
+        out.total_campaign_revenue = 0.0;
+
+    aggregate:
+        out.campaign_conversions   += (in.event_type EQ 'CONVERTED') ? 1 : 0;
+        out.total_campaign_revenue += in.revenue_attributed;
+CAMP_ROLLUP
+
+-- ============================================================
+-- COMPONENT 5: Join customer profiles with retail spend
+-- Equivalent SQL: LEFT JOIN DW_OWNER.STG_CUSTOMER_SALES ON customer_id
+-- ============================================================
+[component "join_retail_spend"]
+type = "join"
+input[0] = "read_stg_customers.out"
+input[1] = "read_retail_spend.out"
+output[0] = "customers_with_spend"
+output[1] = "customers_no_spend"
+join_keys[0] = "customer_id"
+join_keys[1] = "customer_id"
+join_type    = "left_outer"
+
+merge_transform = <<RETAIL_JOIN
+    out.customer_id         = left.customer_id;
+    out.customer_code       = left.customer_code;
+    out.email               = left.email;
+    out.region_code         = left.region_code;
+    out.customer_segment    = left.customer_segment;
+    out.acquisition_channel = left.acquisition_channel;
+    out.is_opted_in_email   = left.is_opted_in_email;
+    out.lifetime_value      = NVL(right.lifetime_value, 0.0);
+    out.loyalty_tier        = NVL(right.loyalty_tier, 'STANDARD');
+    out.last_purchase_date  = right.last_purchase_date;
+RETAIL_JOIN
+
+-- ============================================================
+-- COMPONENT 6: Join with campaign summary
+-- ============================================================
+[component "join_campaign_data"]
+type = "join"
+input[0] = "join_retail_spend.out[0]"
+input[1] = "rollup_campaign_by_customer.out"
+output[0] = "fully_enriched_customers"
+join_keys[0] = "customer_id"
+join_keys[1] = "customer_id"
+join_type    = "left_outer"
+
+merge_transform = <<CAMP_JOIN
+    out.customer_id            = left.customer_id;
+    out.customer_code          = left.customer_code;
+    out.email                  = left.email;
+    out.region_code            = left.region_code;
+    out.customer_segment       = left.customer_segment;
+    out.acquisition_channel    = left.acquisition_channel;
+    out.is_opted_in_email      = left.is_opted_in_email;
+    out.lifetime_value         = left.lifetime_value;
+    out.loyalty_tier           = left.loyalty_tier;
+    out.last_purchase_date     = left.last_purchase_date;
+    out.campaign_conversions   = NVL(right.campaign_conversions,   0);
+    out.total_campaign_revenue = NVL(right.total_campaign_revenue, 0.0);
+CAMP_JOIN
+
+-- ============================================================
+-- COMPONENT 7: Reformat - compute scoring fields
+-- Equivalent SQL:
+--   SELECT *,
+--          CASE WHEN lifetime_value > 5000 THEN 'HIGH_VALUE' ... END AS segment_label,
+--          ROUND(NVL(lifetime_value,0)/1000,4) AS clv_score,
+--          CASE WHEN days_since_purchase > 180 THEN 0.90 ... END AS churn_risk_score,
+--          TO_DATE('YYYY-MM-DD','RUN_DATE') - last_purchase_date AS days_since_purchase
+-- ============================================================
+[component "reformat_score_fields"]
+type = "reformat"
+input  = "join_campaign_data.out[0]"
+output = "scored_customers"
+input_schema  = "enriched_customer_record"
+output_schema = "enriched_customer_record"
+
+transform = <<SCORE_REFORMAT
+    out.customer_id         = in.customer_id;
+    out.customer_code       = in.customer_code;
+    out.full_name           = in.full_name;
+    out.email               = in.email;
+    out.region_code         = in.region_code;
+    out.customer_segment    = in.customer_segment;
+    out.acquisition_channel = in.acquisition_channel;
+    out.is_opted_in_email   = in.is_opted_in_email;
+    out.lifetime_value      = in.lifetime_value;
+    out.loyalty_tier        = in.loyalty_tier;
+    out.last_purchase_date  = in.last_purchase_date;
+
+    -- Days since last purchase
+    out.days_since_purchase = (in.last_purchase_date IS NULL) ? 999 :
+                               date_diff('${RUN_DATE}', in.last_purchase_date, 'DAY');
+
+    out.campaign_conversions   = in.campaign_conversions;
+    out.total_campaign_revenue = in.total_campaign_revenue;
+
+    -- CLV score: normalised lifetime value
+    out.clv_score = round(NVL(in.lifetime_value, 0.0) / 1000.0, 4);
+
+    -- Churn risk: recency-based probability
+    out.churn_risk_score = CASE
+        WHEN in.last_purchase_date IS NULL         THEN 0.95
+        WHEN out.days_since_purchase > 180         THEN 0.80
+        WHEN out.days_since_purchase > 90          THEN 0.50
+        WHEN out.days_since_purchase > 30          THEN 0.20
+        ELSE                                            0.05
+    END;
+
+    -- Engagement: campaign conversion frequency normalised
+    out.engagement_score = round(
+        CASE
+            WHEN in.campaign_conversions > 10 THEN 1.0
+            WHEN in.campaign_conversions > 5  THEN 0.75
+            WHEN in.campaign_conversions > 1  THEN 0.50
+            WHEN in.campaign_conversions > 0  THEN 0.25
+            ELSE                                   0.0
+        END, 4);
+
+    -- Segment label
+    out.segment_label = CASE in.customer_segment
+        WHEN 'VIP'       THEN 'High-Value Premium Customer'
+        WHEN 'RETAIL'    THEN 'Standard Retail Customer'
+        WHEN 'WHOLESALE' THEN 'B2B Wholesale Customer'
+        ELSE                  'Unclassified'
+    END;
+SCORE_REFORMAT
+
+-- ============================================================
+-- COMPONENT 8: Filter - split high-churn customers for campaign targeting
+-- Equivalent SQL: WHERE churn_risk_score > 0.7 (at-risk)
+--                 WHERE churn_risk_score <= 0.7 (standard)
+-- ============================================================
+[component "filter_churn_segments"]
+type = "filter"
+input  = "reformat_score_fields.out"
+output[0] = "standard_customers"
+output[1] = "at_risk_customers"
+
+filter_expression = <<CHURN_FILTER
+    out[0] = (churn_risk_score <= 0.70);
+    out[1] = (churn_risk_score > 0.70);
+CHURN_FILTER
+
+-- ============================================================
+-- COMPONENT 9: Rollup - segment-level aggregation
+-- Equivalent SQL:
+--   SELECT customer_segment, region_code,
+--          COUNT(*) AS customer_count, AVG(clv_score), AVG(churn_risk_score), ...
+--   GROUP BY customer_segment, region_code
+-- ============================================================
+[component "rollup_segment_summary"]
+type = "rollup"
+input  = "reformat_score_fields.out"
+output = "segment_aggregates"
+group_by = "customer_segment, region_code"
+output_schema = "segment_aggregate_record"
+
+aggregate = <<SEG_ROLLUP
+    initialise:
+        out.segment_code         = in.customer_segment;
+        out.region_code          = in.region_code;
+        out.summary_date         = date_from_string('${RUN_DATE}','YYYY-MM-DD');
+        out.customer_count       = 0;
+        out.avg_clv_score        = 0.0;
+        out.avg_churn_risk       = 0.0;
+        out.high_value_count     = 0;
+        out.at_risk_count        = 0;
+        out.opted_in_email_count = 0;
+        out.total_retail_spend   = 0.0;
+
+    aggregate:
+        out.customer_count       += 1;
+        out.avg_clv_score        += in.clv_score;
+        out.avg_churn_risk       += in.churn_risk_score;
+        out.high_value_count     += (in.clv_score > 5.0)            ? 1 : 0;
+        out.at_risk_count        += (in.churn_risk_score > 0.7)     ? 1 : 0;
+        out.opted_in_email_count += (in.is_opted_in_email EQ 'Y')   ? 1 : 0;
+        out.total_retail_spend   += in.lifetime_value;
+
+    finalise:
+        out.avg_clv_score  = out.avg_clv_score  / max(out.customer_count, 1);
+        out.avg_churn_risk = out.avg_churn_risk / max(out.customer_count, 1);
+SEG_ROLLUP
+
+-- ============================================================
+-- COMPONENT 10: Write scored customers to FACT_CUSTOMER_SCORES
+-- ============================================================
+[component "write_customer_scores"]
+type = "write_oracle"
+input  = "reformat_score_fields.out"
+table  = "FACT_CUSTOMER_SCORES"
+mode   = "insert_append"
+connection = "${CRM_ORA_CONNECT}"
+
+-- ============================================================
+-- COMPONENT 11: Write at-risk customers to intervention file
+-- ============================================================
+[component "write_at_risk_file"]
+type = "write_file"
+input  = "filter_churn_segments.out[1]"
+path   = "/opt/etl/crm/at_risk_${CUSTOMER_SEGMENT}_${RUN_DATE}.dat"
+format = "delimited"
+delimiter = "|"
+
+-- ============================================================
+-- COMPONENT 12: Write segment summary to FACT_CUSTOMER_SEGMENT_SUMMARY
+-- ============================================================
+[component "write_segment_summary"]
+type = "write_oracle"
+input  = "rollup_segment_summary.out"
+table  = "FACT_CUSTOMER_SEGMENT_SUMMARY"
+mode   = "insert_append"
+connection = "${CRM_ORA_CONNECT}"
+
+[flow]
+read_stg_customers      -> join_retail_spend[0]
+read_retail_spend       -> join_retail_spend[1]
+read_campaign_events    -> rollup_campaign_by_customer
+rollup_campaign_by_customer -> join_campaign_data[1]
+join_retail_spend[0]    -> join_campaign_data[0]
+join_campaign_data[0]   -> reformat_score_fields
+reformat_score_fields   -> filter_churn_segments
+reformat_score_fields   -> rollup_segment_summary
+reformat_score_fields   -> write_customer_scores
+filter_churn_segments[1]-> write_at_risk_file
+rollup_segment_summary  -> write_segment_summary
